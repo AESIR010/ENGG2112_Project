@@ -10,6 +10,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBRegressor
+from sklearn.model_selection import RandomizedSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
@@ -20,7 +22,7 @@ MODEL_DIR = Path("models")
 OUTPUT_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
-TARGET = "AC_POWER"
+TARGET = "TARGET_FUTURE_15MIN"
 
 
 GENERATION_FILES = [
@@ -225,13 +227,18 @@ def prepare_dataset():
     df = add_time_features(df)
     df = add_lag_features(df)
 
+    grouped = df.groupby("PLANT_ID")
+
+    df["TARGET_FUTURE_15MIN"] = grouped["AC_POWER"].shift(-1)
+
     numeric_cols = df.select_dtypes(include=["number"]).columns
     df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+
+    df = df.dropna(subset=["TARGET_FUTURE_15MIN"])
 
     df = df.dropna().reset_index(drop=True)
 
     return df
-
 
 def chronological_split(df, train_ratio=0.60, val_ratio=0.20, test_ratio=0.20):
     """
@@ -331,6 +338,16 @@ def build_models():
             max_leaf_nodes=31,
             l2_regularization=0.05,
             random_state=42
+        ),
+
+        "xgboost": XGBRegressor(
+            n_estimators=300,
+            max_depth=8,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="reg:squarederror",
+            random_state=42
         )
     }
 
@@ -355,14 +372,42 @@ def train_and_validate_models(X_train, y_train, X_val, y_val):
     trained_models = {}
     metric_rows = []
 
+    rf_param_grid = {
+        "n_estimators": [100, 200, 300, 500],
+        "max_depth": [8, 12, 16, 24, None],
+        "min_samples_leaf": [1, 2, 4],
+        "max_features": ["sqrt", "log2", None]
+    }
+
     for model_name, model in models.items():
         print(f"Training {model_name}...")
 
-        model.fit(X_train, y_train)
+        if model_name == "random_forest":
+
+            search = RandomizedSearchCV(
+                estimator=model,
+                param_distributions=rf_param_grid,
+                n_iter=15,
+                scoring="neg_root_mean_squared_error",
+                cv=3,
+                random_state=42,
+                n_jobs=-1
+            )
+
+            search.fit(X_train, y_train)
+
+            print("Best RF params:", search.best_params_)
+
+            model = search.best_estimator_
+
+        else:
+            model.fit(X_train, y_train)
+
         trained_models[model_name] = model
 
         train_pred = model.predict(X_train)
         val_pred = model.predict(X_val)
+
 
         train_metrics = calculate_metrics(y_train, train_pred)
         val_metrics = calculate_metrics(y_val, val_pred)
@@ -474,6 +519,30 @@ def main():
 
     print("\nFinal test performance:")
     for key, value in test_metrics.items():
+        print(f"{key}: {value:.4f}")
+
+    print("\nPersistence baseline performance:")
+
+    persistence_val_pred = X_val["ac_lag_15min"]
+
+    persistence_val_metrics = calculate_metrics(
+        y_val,
+        persistence_val_pred
+    )
+
+    print("\nValidation persistence metrics:")
+    for key, value in persistence_val_metrics.items():
+        print(f"{key}: {value:.4f}")
+
+    persistence_test_pred = X_test["ac_lag_15min"]
+
+    persistence_test_metrics = calculate_metrics(
+        y_test,
+        persistence_test_pred
+    )
+
+    print("\nTest persistence metrics:")
+    for key, value in persistence_test_metrics.items():
         print(f"{key}: {value:.4f}")
 
     test_row = {
