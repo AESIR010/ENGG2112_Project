@@ -11,6 +11,7 @@ from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegresso
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from xgboost import XGBRegressor
 
 DATA_DIR = Path("cleaned_pvoutput")
 OUTPUT_DIR = Path("outputs")
@@ -282,9 +283,10 @@ def build_models():
         ]),
 
         "random_forest": RandomForestRegressor(
-            n_estimators=80,
-            max_depth=16,
-            min_samples_leaf=2,
+            n_estimators=400,
+            max_depth=10,
+            min_samples_leaf=6,
+            max_features="sqrt",
             random_state=42,
             n_jobs=-1
         ),
@@ -295,6 +297,18 @@ def build_models():
             max_leaf_nodes=31,
             l2_regularization=0.05,
             random_state=42
+        ),
+
+        "xgboost": XGBRegressor(
+            n_estimators=500,
+            learning_rate=0.03,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.05,
+            reg_lambda=1.0,
+            random_state=42,
+            n_jobs=-1
         )
     }
 
@@ -448,6 +462,17 @@ def main():
 
     test_predictions = best_model.predict(X_test)
     test_metrics = calculate_metrics(y_test, test_predictions)
+
+    persistence_predictions = test_df["power_lag_10min"]
+
+    persistence_metrics = calculate_metrics(
+        y_test,
+        persistence_predictions
+    )
+
+    print("\nPersistence Baseline Performance:")
+    for key, value in persistence_metrics.items():
+        print(f"{key}: {value:.4f}")
 
     if hasattr(best_model, "feature_importances_"):
         importances = pd.Series(
