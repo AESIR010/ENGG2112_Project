@@ -12,8 +12,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-
-DATA_DIR = Path("data")
+DATA_DIR = Path("cleaned_pvoutput")
 OUTPUT_DIR = Path("outputs")
 MODEL_DIR = Path("models")
 
@@ -30,7 +29,7 @@ LEAKAGE_COLUMNS = [
     "target_generation_kwh",
     "target_average_power_w",
     "capacity_factor",
-
+    "target_generation_wh_raw_before_cleaning",
     "pv_interval_average_power_w",
     "pv_instantaneous_power_w",
     "pv_average_power_w",
@@ -133,37 +132,6 @@ def add_ramp_features(df):
 
     return df
 
-def parse_datetime_column(series):
-    """
-    Handles both formats:
-    - 15-05-2020 00:00
-    - 2020-05-15 00:00:00
-    """
-    text = series.astype(str)
-    is_iso = text.str.match(r"^\d{4}-\d{2}-\d{2}")
-
-    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-
-    parsed.loc[is_iso] = pd.to_datetime(
-        text.loc[is_iso],
-        format="%Y-%m-%d %H:%M:%S",
-        errors="coerce"
-    )
-
-    parsed.loc[~is_iso] = pd.to_datetime(
-        text.loc[~is_iso],
-        format="%d-%m-%Y %H:%M",
-        errors="coerce"
-    )
-
-    if parsed.isna().any():
-        parsed = parsed.fillna(pd.to_datetime(text, dayfirst=True, errors="coerce"))
-
-    if parsed.isna().any():
-        raise ValueError("Some timestamp values could not be parsed.")
-
-    return parsed
-
 def add_time_features(df):
     df = df.copy()
 
@@ -189,22 +157,71 @@ def add_time_features(df):
 def prepare_dataset():
 
     df = load_dataset()
-
+    print("Initial rows:", len(df)) # debug
+    
     df = create_future_target(df)
+    print("After target:", len(df))
 
     df = add_time_features(df)
+    print("After time features:", len(df))
 
     df = add_lag_features(df)
+    print("After lags:", len(df))
 
     df = add_rolling_features(df)
+    print("After rolling:", len(df))
 
     df = add_ramp_features(df)
+    print("After ramp:", len(df))
 
     df = df.drop(columns=LEAKAGE_COLUMNS, errors="ignore")
+    print("After leakage columns:", len(df))
 
     df = df.replace([np.inf, -np.inf], np.nan)
 
-    df = df.dropna().reset_index(drop=True)
+    # convert booleans to integers
+    bool_cols = df.select_dtypes(include=["bool"]).columns
+    df[bool_cols] = df[bool_cols].astype(int)
+
+    # remove non-numeric columns except timestamp
+    non_numeric = df.select_dtypes(
+        exclude=[np.number, "datetime"]
+    ).columns
+
+    non_numeric = [
+        c for c in non_numeric
+        if c != "timestamp"
+    ]
+
+    df = df.drop(columns=non_numeric)
+    print("After drop non numeric:", len(df))
+
+    df = df.drop(columns=[
+        "pv_temperature_c",
+        "pv_voltage_v",
+    ], errors="ignore")
+
+    nan_counts = df.isna().sum()
+    print("\nColumns containing NaNs:")
+    print(nan_counts[nan_counts > 0].sort_values(ascending=False))
+
+    required_columns = [
+        TARGET,
+        "power_lag_10min",
+        "sat_shortwave_radiation",
+    ]
+
+    df = df.dropna(
+        subset=required_columns
+    ).reset_index(drop=True)
+
+    df = df.fillna(0)
+
+    print("After drop na:", len(df))
+
+
+    df = df[df["is_daylight"] == 1]
+    print("After is_daylight:", len(df))
 
     return df
 
@@ -244,14 +261,12 @@ EXCLUDED_COLUMNS = [
 
 
 def make_features(df):
-
     feature_columns = [
         c for c in df.columns
         if c not in EXCLUDED_COLUMNS
     ]
 
     X = df[feature_columns].copy()
-
     y = df[TARGET].copy()
 
     return X, y, feature_columns
@@ -366,32 +381,39 @@ def plot_actual_vs_predicted(predictions_df):
 
 
 def plot_residuals(predictions_df):
-    residuals = predictions_df["actual_AC_POWER"] - predictions_df["predicted_AC_POWER"]
+    residuals = (
+        predictions_df["actual"] -
+        predictions_df["predicted"]
+    )
 
     plt.figure(figsize=(10, 6))
 
     plt.scatter(
-        predictions_df["predicted_AC_POWER"],
+        predictions_df["predicted"],
         residuals,
         alpha=0.6
     )
 
     plt.axhline(0, linestyle="--")
-    plt.xlabel("Predicted AC power output")
+
+    plt.xlabel("Predicted power output")
     plt.ylabel("Residual: actual - predicted")
+
     plt.title("Residual Plot")
+
     plt.tight_layout()
 
-    plt.savefig(OUTPUT_DIR / "residual_plot.png", dpi=150)
-    plt.close()
+    plt.savefig(
+        OUTPUT_DIR / "residual_plot.png",
+        dpi=150
+    )
 
+    plt.close()
 
 def main():
     print("Preparing dataset...")
+
     df = prepare_dataset()
-
-    df = df.drop(columns=LEAKAGE_COLUMNS, errors="ignore")
-
     df.to_csv(OUTPUT_DIR / "processed_solar_dataset.csv", index=False)
 
     print(f"Total prepared rows: {len(df)}")
@@ -426,6 +448,15 @@ def main():
 
     test_predictions = best_model.predict(X_test)
     test_metrics = calculate_metrics(y_test, test_predictions)
+
+    if hasattr(best_model, "feature_importances_"):
+        importances = pd.Series(
+            best_model.feature_importances_,
+            index=feature_columns
+        ).sort_values(ascending=False)
+
+        print("\nTop 20 Feature Importances:")
+        print(importances.head(20))
 
     print("\nFinal test performance:")
     for key, value in test_metrics.items():
@@ -463,7 +494,7 @@ def main():
     model_bundle = {
         "model": best_model,
         "best_model_name": best_model_name,
-        "encoded_feature_columns": encoded_features,
+        "feature_columns": feature_columns,
         "target": TARGET,
         "trained_at": datetime.now().isoformat(timespec="seconds"),
         "test_metrics": test_metrics
@@ -478,7 +509,6 @@ def main():
     print(f"- {OUTPUT_DIR / 'actual_vs_predicted.png'}")
     print(f"- {OUTPUT_DIR / 'residual_plot.png'}")
     print(f"- {MODEL_DIR / 'best_solar_model.joblib'}")
-
 
 if __name__ == "__main__":
     main()
