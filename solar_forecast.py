@@ -13,7 +13,16 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 
+tscv = TimeSeriesSplit(n_splits=3)
+
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="`sklearn.utils.parallel.delayed` should be used"
+)
 
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("outputs")
@@ -341,11 +350,6 @@ def build_models():
         ),
 
         "xgboost": XGBRegressor(
-            n_estimators=300,
-            max_depth=8,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
             objective="reg:squarederror",
             random_state=42
         )
@@ -379,6 +383,15 @@ def train_and_validate_models(X_train, y_train, X_val, y_val):
         "max_features": ["sqrt", "log2", None]
     }
 
+    xgb_param_grid = {
+        "n_estimators": [200, 300, 500],
+        "max_depth": [6, 8, 10],
+        "learning_rate": [0.03, 0.05, 0.1],
+        "subsample": [0.8, 1.0],
+        "colsample_bytree": [0.8, 1.0],
+        "min_child_weight": [1, 2]
+    }
+
     for model_name, model in models.items():
         print(f"Training {model_name}...")
 
@@ -389,7 +402,7 @@ def train_and_validate_models(X_train, y_train, X_val, y_val):
                 param_distributions=rf_param_grid,
                 n_iter=15,
                 scoring="neg_root_mean_squared_error",
-                cv=3,
+                cv=tscv,
                 random_state=42,
                 n_jobs=-1
             )
@@ -397,6 +410,24 @@ def train_and_validate_models(X_train, y_train, X_val, y_val):
             search.fit(X_train, y_train)
 
             print("Best RF params:", search.best_params_)
+
+            model = search.best_estimator_
+
+        elif model_name == "xgboost":
+
+            search = RandomizedSearchCV(
+                estimator=model,
+                param_distributions=xgb_param_grid,
+                n_iter=20,
+                scoring="neg_root_mean_squared_error",
+                cv=tscv,
+                random_state=42,
+                n_jobs=-1
+            )
+
+            search.fit(X_train, y_train)
+
+            print("Best XGB params:", search.best_params_)
 
             model = search.best_estimator_
 
@@ -430,7 +461,7 @@ def train_and_validate_models(X_train, y_train, X_val, y_val):
     best_model_name = validation_results.sort_values("RMSE").iloc[0]["model"]
     best_model = trained_models[best_model_name]
 
-    return best_model_name, best_model, metrics_df
+    return best_model_name, best_model, metrics_df, trained_models
 
 
 def plot_actual_vs_predicted(predictions_df):
@@ -505,7 +536,7 @@ def main():
     X_val, y_val, _ = make_features(val_df, encoded_features)
     X_test, y_test, _ = make_features(test_df, encoded_features)
 
-    best_model_name, best_model, metrics_df = train_and_validate_models(
+    best_model_name, best_model, metrics_df, trained_models = train_and_validate_models(
         X_train,
         y_train,
         X_val,
@@ -519,6 +550,15 @@ def main():
 
     print("\nFinal test performance:")
     for key, value in test_metrics.items():
+        print(f"{key}: {value:.4f}")
+
+    xgb_model = trained_models["xgboost"]
+
+    xgb_test_pred = xgb_model.predict(X_test)
+    xgb_test_metrics = calculate_metrics(y_test, xgb_test_pred)
+
+    print("\nXGBoost test performance:")
+    for key, value in xgb_test_metrics.items():
         print(f"{key}: {value:.4f}")
 
     print("\nPersistence baseline performance:")
