@@ -20,19 +20,118 @@ MODEL_DIR = Path("models")
 OUTPUT_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
-TARGET = "AC_POWER"
+FORECAST_HORIZON = 6 # dataset in 10 min intervals - 1hr ahead forecast
+TARGET = "TARGET_FUTURE"
 
+DATASET_FILE = "humeridge_2024_10min_dataset_WOKRING.csv"
 
-GENERATION_FILES = [
-    "Plant_1_Generation_Data.csv",
-    "Plant_2_Generation_Data.csv",
+LEAKAGE_COLUMNS = [
+    "target_generation_wh",
+    "target_generation_kwh",
+    "target_average_power_w",
+    "capacity_factor",
+
+    "pv_interval_average_power_w",
+    "pv_instantaneous_power_w",
+    "pv_average_power_w",
+    "pv_normalised_output_kw_per_kw",
 ]
 
-WEATHER_FILES = [
-    "Plant_1_Weather_Sensor_Data.csv",
-    "Plant_2_Weather_Sensor_Data.csv",
-]
+def load_dataset():
+    path = DATA_DIR / DATASET_FILE
 
+    df = pd.read_csv(path)
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    return df
+
+def create_future_target(df):
+    df = df.copy()
+
+    df["TARGET_FUTURE"] = (
+        df["target_generation_wh"]
+        .shift(-FORECAST_HORIZON)
+    )
+
+    return df
+
+def add_lag_features(df):
+    df = df.copy()
+
+    lag_columns = [
+        "sat_global_tilted_irradiance",
+        "sat_shortwave_radiation",
+        "weather_cloud_cover",
+        "weather_temperature_2m",
+    ]
+
+    for col in lag_columns:
+
+        df[f"{col}_lag_10min"] = df[col].shift(1)
+
+        df[f"{col}_lag_1h"] = df[col].shift(6)
+
+        df[f"{col}_lag_24h"] = df[col].shift(144)
+
+    # lag previous power output
+    df["power_lag_10min"] = (
+        df["target_generation_wh"].shift(1)
+    )
+
+    df["power_lag_1h"] = (
+        df["target_generation_wh"].shift(6)
+    )
+
+    df["power_lag_24h"] = (
+        df["target_generation_wh"].shift(144)
+    )
+
+    return df
+
+def add_rolling_features(df):
+    df = df.copy()
+
+    rolling_columns = [
+        "sat_global_tilted_irradiance",
+        "weather_cloud_cover",
+        "target_generation_wh",
+    ]
+
+    for col in rolling_columns:
+
+        df[f"{col}_rolling_mean_1h"] = (
+            df[col]
+            .shift(1)
+            .rolling(window=6)
+            .mean()
+        )
+
+        df[f"{col}_rolling_std_1h"] = (
+            df[col]
+            .shift(1)
+            .rolling(window=6)
+            .std()
+        )
+
+    return df
+
+def add_ramp_features(df):
+    df = df.copy()
+
+    ramp_columns = [
+        "sat_global_tilted_irradiance",
+        "weather_cloud_cover",
+        "target_generation_wh",
+    ]
+
+    for col in ramp_columns:
+
+        df[f"{col}_delta"] = df[col].diff()
+
+    return df
 
 def parse_datetime_column(series):
     """
@@ -61,99 +160,18 @@ def parse_datetime_column(series):
         parsed = parsed.fillna(pd.to_datetime(text, dayfirst=True, errors="coerce"))
 
     if parsed.isna().any():
-        raise ValueError("Some DATE_TIME values could not be parsed.")
+        raise ValueError("Some timestamp values could not be parsed.")
 
     return parsed
-
-
-def load_generation_data():
-    frames = []
-
-    for file in GENERATION_FILES:
-        path = DATA_DIR / file
-        if path.exists():
-            df = pd.read_csv(path)
-            frames.append(df)
-
-    if not frames:
-        raise FileNotFoundError("No generation CSV files found.")
-
-    generation = pd.concat(frames, ignore_index=True)
-    generation["DATE_TIME"] = parse_datetime_column(generation["DATE_TIME"])
-
-    # Raw generation data is inverter-level.
-    # Aggregate inverter output into total plant output per timestamp.
-    plant_generation = (
-        generation
-        .groupby(["PLANT_ID", "DATE_TIME"], as_index=False)
-        .agg(
-            DC_POWER=("DC_POWER", "sum"),
-            AC_POWER=("AC_POWER", "sum"),
-            DAILY_YIELD=("DAILY_YIELD", "sum"),
-            TOTAL_YIELD=("TOTAL_YIELD", "sum"),
-            INVERTER_COUNT=("SOURCE_KEY", "nunique")
-        )
-        .sort_values(["DATE_TIME", "PLANT_ID"])
-        .reset_index(drop=True)
-    )
-
-    return plant_generation
-
-
-def load_weather_data():
-    frames = []
-
-    for file in WEATHER_FILES:
-        path = DATA_DIR / file
-        if path.exists():
-            df = pd.read_csv(path)
-            frames.append(df)
-
-    if not frames:
-        raise FileNotFoundError("No weather CSV files found.")
-
-    weather = pd.concat(frames, ignore_index=True)
-    weather["DATE_TIME"] = parse_datetime_column(weather["DATE_TIME"])
-
-    plant_weather = (
-        weather
-        .groupby(["PLANT_ID", "DATE_TIME"], as_index=False)
-        .agg(
-            AMBIENT_TEMPERATURE=("AMBIENT_TEMPERATURE", "mean"),
-            MODULE_TEMPERATURE=("MODULE_TEMPERATURE", "mean"),
-            IRRADIATION=("IRRADIATION", "mean")
-        )
-        .sort_values(["DATE_TIME", "PLANT_ID"])
-        .reset_index(drop=True)
-    )
-
-    return plant_weather
-
-
-def build_dataset():
-    generation = load_generation_data()
-    weather = load_weather_data()
-
-    df = pd.merge(
-        generation,
-        weather,
-        on=["PLANT_ID", "DATE_TIME"],
-        how="inner"
-    )
-
-    df = df.sort_values(["DATE_TIME", "PLANT_ID"]).reset_index(drop=True)
-
-    return df
-
 
 def add_time_features(df):
     df = df.copy()
 
-    df["hour"] = df["DATE_TIME"].dt.hour
-    df["minute"] = df["DATE_TIME"].dt.minute
-    df["day_of_week"] = df["DATE_TIME"].dt.dayofweek
-    df["month"] = df["DATE_TIME"].dt.month
-    df["day_of_year"] = df["DATE_TIME"].dt.dayofyear
+    df["hour"] = df["timestamp"].dt.hour
+    df["minute"] = df["timestamp"].dt.minute
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+    df["month"] = df["timestamp"].dt.month
+    df["day_of_year"] = df["timestamp"].dt.dayofyear
 
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
@@ -162,71 +180,29 @@ def add_time_features(df):
     df["day_of_year_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365)
 
     df["is_daylight"] = (
-        (df["IRRADIATION"] > 0) |
+        (df["sat_shortwave_radiation"] > 0) |
         (df["hour"].between(6, 18))
     ).astype(int)
 
     return df
 
-
-def add_lag_features(df):
-    """
-    Dataset interval is 15 minutes.
-    1 row = 15 minutes
-    4 rows = 1 hour
-    96 rows = 24 hours
-    """
-    df = df.copy()
-    df = df.sort_values(["PLANT_ID", "DATE_TIME"]).reset_index(drop=True)
-
-    grouped = df.groupby("PLANT_ID", group_keys=False)
-
-    df["ac_lag_15min"] = grouped["AC_POWER"].shift(1)
-    df["ac_lag_1h"] = grouped["AC_POWER"].shift(4)
-    df["ac_lag_24h"] = grouped["AC_POWER"].shift(96)
-
-    df["irr_lag_15min"] = grouped["IRRADIATION"].shift(1)
-    df["irr_lag_1h"] = grouped["IRRADIATION"].shift(4)
-    df["irr_lag_24h"] = grouped["IRRADIATION"].shift(96)
-
-    df["rolling_ac_mean_1h"] = grouped["AC_POWER"].transform(
-        lambda s: s.shift(1).rolling(window=4, min_periods=1).mean()
-    )
-
-    df["rolling_ac_mean_24h"] = grouped["AC_POWER"].transform(
-        lambda s: s.shift(1).rolling(window=96, min_periods=1).mean()
-    )
-
-    df["rolling_irr_mean_1h"] = grouped["IRRADIATION"].transform(
-        lambda s: s.shift(1).rolling(window=4, min_periods=1).mean()
-    )
-
-    lag_columns = [
-        "ac_lag_15min",
-        "ac_lag_1h",
-        "ac_lag_24h",
-        "irr_lag_15min",
-        "irr_lag_1h",
-        "irr_lag_24h",
-        "rolling_ac_mean_1h",
-        "rolling_ac_mean_24h",
-        "rolling_irr_mean_1h",
-    ]
-
-    df[lag_columns] = df[lag_columns].fillna(0)
-
-    df = df.sort_values(["DATE_TIME", "PLANT_ID"]).reset_index(drop=True)
-
-    return df
-
-
 def prepare_dataset():
-    df = build_dataset()
+
+    df = load_dataset()
+
+    df = create_future_target(df)
+
     df = add_time_features(df)
+
     df = add_lag_features(df)
 
-    numeric_cols = df.select_dtypes(include=["number"]).columns
-    df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+    df = add_rolling_features(df)
+
+    df = add_ramp_features(df)
+
+    df = df.drop(columns=LEAKAGE_COLUMNS, errors="ignore")
+
+    df = df.replace([np.inf, -np.inf], np.nan)
 
     df = df.dropna().reset_index(drop=True)
 
@@ -243,9 +219,9 @@ def chronological_split(df, train_ratio=0.60, val_ratio=0.20, test_ratio=0.20):
     if round(train_ratio + val_ratio + test_ratio, 5) != 1:
         raise ValueError("Split ratios must add to 1.")
 
-    df = df.sort_values(["DATE_TIME", "PLANT_ID"]).reset_index(drop=True)
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
-    unique_times = np.array(sorted(df["DATE_TIME"].unique()))
+    unique_times = np.array(sorted(df["timestamp"].unique()))
 
     train_end = int(len(unique_times) * train_ratio)
     val_end = int(len(unique_times) * (train_ratio + val_ratio))
@@ -254,58 +230,31 @@ def chronological_split(df, train_ratio=0.60, val_ratio=0.20, test_ratio=0.20):
     val_times = set(unique_times[train_end:val_end])
     test_times = set(unique_times[val_end:])
 
-    train_df = df[df["DATE_TIME"].isin(train_times)].copy()
-    val_df = df[df["DATE_TIME"].isin(val_times)].copy()
-    test_df = df[df["DATE_TIME"].isin(test_times)].copy()
+    train_df = df[df["timestamp"].isin(train_times)].copy()
+    val_df = df[df["timestamp"].isin(val_times)].copy()
+    test_df = df[df["timestamp"].isin(test_times)].copy()
 
     return train_df, val_df, test_df
 
 
-FEATURE_COLUMNS = [
-    "PLANT_ID",
-    "AMBIENT_TEMPERATURE",
-    "MODULE_TEMPERATURE",
-    "IRRADIATION",
-
-    "hour",
-    "minute",
-    "day_of_week",
-    "month",
-    "day_of_year",
-
-    "hour_sin",
-    "hour_cos",
-    "day_of_year_sin",
-    "day_of_year_cos",
-    "is_daylight",
-
-    "ac_lag_15min",
-    "ac_lag_1h",
-    "ac_lag_24h",
-
-    "irr_lag_15min",
-    "irr_lag_1h",
-    "irr_lag_24h",
-
-    "rolling_ac_mean_1h",
-    "rolling_ac_mean_24h",
-    "rolling_irr_mean_1h",
+EXCLUDED_COLUMNS = [
+    "timestamp",
+    TARGET,
 ]
 
 
-def make_features(df, feature_columns_after_encoding=None):
-    X = df[FEATURE_COLUMNS].copy()
+def make_features(df):
+
+    feature_columns = [
+        c for c in df.columns
+        if c not in EXCLUDED_COLUMNS
+    ]
+
+    X = df[feature_columns].copy()
+
     y = df[TARGET].copy()
 
-    # Treat plant ID as categorical, not a normal numeric variable.
-    X = pd.get_dummies(X, columns=["PLANT_ID"], prefix="plant", dtype=float)
-
-    if feature_columns_after_encoding is None:
-        feature_columns_after_encoding = list(X.columns)
-    else:
-        X = X.reindex(columns=feature_columns_after_encoding, fill_value=0)
-
-    return X, y, feature_columns_after_encoding
+    return X, y, feature_columns
 
 
 def build_models():
@@ -391,17 +340,17 @@ def train_and_validate_models(X_train, y_train, X_val, y_val):
 def plot_actual_vs_predicted(predictions_df):
     plt.figure(figsize=(12, 6))
 
-    plot_df = predictions_df.sort_values("DATE_TIME")
+    plot_df = predictions_df.sort_values("timestamp")
 
     plt.plot(
-        plot_df["DATE_TIME"],
-        plot_df["actual_AC_POWER"],
+        plot_df["timestamp"],
+        plot_df["actual"],
         label="Actual"
     )
 
     plt.plot(
-        plot_df["DATE_TIME"],
-        plot_df["predicted_AC_POWER"],
+        plot_df["timestamp"],
+        plot_df["predicted"],
         label="Predicted"
     )
 
@@ -441,6 +390,8 @@ def main():
     print("Preparing dataset...")
     df = prepare_dataset()
 
+    df = df.drop(columns=LEAKAGE_COLUMNS, errors="ignore")
+
     df.to_csv(OUTPUT_DIR / "processed_solar_dataset.csv", index=False)
 
     print(f"Total prepared rows: {len(df)}")
@@ -456,9 +407,13 @@ def main():
     print(f"Validation rows: {len(val_df)}")
     print(f"Testing rows: {len(test_df)}")
 
-    X_train, y_train, encoded_features = make_features(train_df)
-    X_val, y_val, _ = make_features(val_df, encoded_features)
-    X_test, y_test, _ = make_features(test_df, encoded_features)
+    X_train, y_train, feature_columns = make_features(train_df)
+
+    X_val = val_df[feature_columns]
+    y_val = val_df[TARGET]
+
+    X_test = test_df[feature_columns]
+    y_test = test_df[TARGET]
 
     best_model_name, best_model, metrics_df = train_and_validate_models(
         X_train,
@@ -489,12 +444,15 @@ def main():
 
     metrics_df.to_csv(OUTPUT_DIR / "model_metrics.csv", index=False)
 
-    predictions_df = test_df[["DATE_TIME", "PLANT_ID", TARGET]].copy()
-    predictions_df = predictions_df.rename(columns={TARGET: "actual_AC_POWER"})
-    predictions_df["predicted_AC_POWER"] = test_predictions
+    predictions_df = pd.DataFrame({
+        "timestamp": test_df["timestamp"],
+        "actual": y_test,
+        "predicted": test_predictions
+    })
+
     predictions_df["error"] = (
-        predictions_df["actual_AC_POWER"] -
-        predictions_df["predicted_AC_POWER"]
+        predictions_df["actual"] -
+        predictions_df["predicted"]
     )
 
     predictions_df.to_csv(OUTPUT_DIR / "test_predictions.csv", index=False)
